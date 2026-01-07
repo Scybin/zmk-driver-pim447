@@ -3,7 +3,7 @@
 
 config ZMK_TRACKBALL_PIM447
 	bool "PIM447 trackball module driver support"
-	depends on ZMK_INPUT
+	depends on ZMK_POINTING
 	select I2C
 	help
 	  Enable support for the Pimoroni PIM447 trackball module driver
