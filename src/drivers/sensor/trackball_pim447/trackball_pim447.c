@@ -2,10 +2,10 @@
  * Copyright (c) 2023-2025 The ZMK Contributors
  * SPDX-License-Identifier: MIT
  *
- * PIM447 trackball driver:
- * - Polls the device over I2C (no INT pin required)
+ * PIM447 trackball driver (polling, no INT pin required)
+ * - Polls the device over I2C
  * - Emits Zephyr input events so ZMK v0.3 input listeners can consume movement
- * - Keeps a sensor API for optional mode/LED control via sensor attributes
+ * - Writes RGBW LED registers on init (and supports RGB updates via sensor attr)
  */
 
 #define DT_DRV_COMPAT pimoroni_trackball_pim447
@@ -21,7 +21,6 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
 
-/* Use default log level unless you override globally */
 LOG_MODULE_REGISTER(trackball_pim447);
 
 /* Custom sensor attributes (private range) */
@@ -32,6 +31,7 @@ LOG_MODULE_REGISTER(trackball_pim447);
 #define TRACKBALL_PIM447_REG_LED_RED 0x00
 #define TRACKBALL_PIM447_REG_LED_GREEN 0x01
 #define TRACKBALL_PIM447_REG_LED_BLUE 0x02
+#define TRACKBALL_PIM447_REG_LED_WHITE 0x03
 
 #define TRACKBALL_PIM447_REG_LEFT 0x04
 #define TRACKBALL_PIM447_REG_RIGHT 0x05
@@ -50,8 +50,8 @@ struct trackball_pim447_data {
     int16_t dx;
     int16_t dy;
 
-    uint8_t button_state;
-    uint8_t prev_button_state;
+    uint8_t button_state;      /* 0/1 */
+    uint8_t prev_button_state; /* 0/1 */
 
     bool invert_x;
     bool invert_y;
@@ -65,6 +65,7 @@ struct trackball_pim447_data {
     uint8_t led_red;
     uint8_t led_green;
     uint8_t led_blue;
+    uint8_t led_white;
 
     struct k_work_delayable poll_work;
 };
@@ -76,6 +77,7 @@ struct trackball_pim447_config {
     uint8_t led_red;
     uint8_t led_green;
     uint8_t led_blue;
+    uint8_t led_white;
 
     bool invert_x;
     bool invert_y;
@@ -84,7 +86,7 @@ struct trackball_pim447_config {
     uint8_t move_factor;
     uint8_t scroll_factor;
 
-    /* Optional DT property (poll-interval-ms). If not present, defaults below. */
+    /* DT: poll-interval-ms (defaults to 10 if not present) */
     uint16_t poll_interval_ms;
 };
 
@@ -102,7 +104,7 @@ static int trackball_pim447_read_reg(const struct device *dev, uint8_t reg, uint
 
 static int trackball_pim447_write_reg(const struct device *dev, uint8_t reg, uint8_t value) {
     const struct trackball_pim447_config *config = dev->config;
-    uint8_t buf[2] = { reg, value };
+    uint8_t buf[2] = {reg, value};
 
     int err = i2c_write_dt(&config->i2c, buf, sizeof(buf));
     if (err) {
@@ -142,15 +144,15 @@ static int trackball_pim447_read_motion_burst(const struct device *dev, int16_t 
         return err;
     }
 
-    const uint8_t left  = buf[0];
+    const uint8_t left = buf[0];
     const uint8_t right = buf[1];
-    const uint8_t up    = buf[2];
-    const uint8_t down  = buf[3];
-    const uint8_t sw    = buf[4];
+    const uint8_t up = buf[2];
+    const uint8_t down = buf[3];
+    const uint8_t sw = buf[4];
 
     *dx = (int16_t)right - (int16_t)left;
     *dy = (int16_t)down - (int16_t)up;
-    *btn = sw;
+    *btn = (sw & 0x01) ? 1 : 0;
 
     /* Prevent accumulation if the device does not auto-clear on read */
     (void)trackball_pim447_clear_motion_regs(dev);
@@ -158,22 +160,25 @@ static int trackball_pim447_read_motion_burst(const struct device *dev, int16_t 
     return 0;
 }
 
-static int trackball_pim447_set_led(const struct device *dev, uint8_t red, uint8_t green, uint8_t blue) {
+/* RGBW LED setter */
+static int trackball_pim447_set_led_rgbw(const struct device *dev, uint8_t red, uint8_t green,
+                                         uint8_t blue, uint8_t white) {
+    const struct trackball_pim447_config *config = dev->config;
     struct trackball_pim447_data *data = dev->data;
-    int err;
 
-    err = trackball_pim447_write_reg(dev, TRACKBALL_PIM447_REG_LED_RED, red);
-    if (err) return err;
+    /* Write starting at LED_RED, auto-increment across RGBW */
+    uint8_t buf[5] = {TRACKBALL_PIM447_REG_LED_RED, red, green, blue, white};
 
-    err = trackball_pim447_write_reg(dev, TRACKBALL_PIM447_REG_LED_GREEN, green);
-    if (err) return err;
-
-    err = trackball_pim447_write_reg(dev, TRACKBALL_PIM447_REG_LED_BLUE, blue);
-    if (err) return err;
+    int err = i2c_write_dt(&config->i2c, buf, sizeof(buf));
+    if (err) {
+        LOG_ERR("Failed to set LED RGBW(%d,%d,%d,%d): %d", red, green, blue, white, err);
+        return err;
+    }
 
     data->led_red = red;
     data->led_green = green;
     data->led_blue = blue;
+    data->led_white = white;
 
     return 0;
 }
@@ -256,11 +261,11 @@ static int trackball_pim447_attr_set(const struct device *dev, enum sensor_chann
         if (!val) {
             return -EINVAL;
         }
-        /* Expect val[0], val[1], val[2] => RGB */
+        /* Expect val[0], val[1], val[2] => RGB. Keep current white unchanged. */
         uint8_t r = CLAMP(val[0].val1, 0, 255);
         uint8_t g = CLAMP(val[1].val1, 0, 255);
         uint8_t b = CLAMP(val[2].val1, 0, 255);
-        return trackball_pim447_set_led(dev, r, g, b);
+        return trackball_pim447_set_led_rgbw(dev, r, g, b, data->led_white);
     }
 
     case PIM447_ATTR_MODE: {
@@ -327,7 +332,6 @@ static void trackball_pim447_poll_work_handler(struct k_work *work) {
 static int trackball_pim447_init(const struct device *dev) {
     const struct trackball_pim447_config *config = dev->config;
     struct trackball_pim447_data *data = dev->data;
-    int err;
 
     data->dev = dev;
 
@@ -344,7 +348,10 @@ static int trackball_pim447_init(const struct device *dev) {
     data->mode = 0; /* default MOVE */
     data->prev_button_state = 0;
 
-    err = trackball_pim447_set_led(dev, config->led_red, config->led_green, config->led_blue);
+    /* Initialize LED state and set initial RGBW */
+    data->led_white = config->led_white;
+    int err = trackball_pim447_set_led_rgbw(dev, config->led_red, config->led_green, config->led_blue,
+                                            config->led_white);
     if (err) {
         LOG_ERR("Failed to set initial LED color: %d", err);
         return err;
@@ -363,24 +370,25 @@ static int trackball_pim447_init(const struct device *dev) {
 }
 
 /* Driver instantiation */
-#define TRACKBALL_PIM447_INIT(inst)                                                       \
-    static struct trackball_pim447_data trackball_pim447_data_##inst;                     \
-                                                                                          \
-    static const struct trackball_pim447_config trackball_pim447_config_##inst = {        \
-        .i2c = I2C_DT_SPEC_INST_GET(inst),                                                \
-        .led_red = DT_INST_PROP_OR(inst, led_red, 0),                                     \
-        .led_green = DT_INST_PROP_OR(inst, led_green, 0),                                 \
-        .led_blue = DT_INST_PROP_OR(inst, led_blue, 0),                                   \
-        .invert_x = DT_INST_PROP_OR(inst, invert_x, false),                               \
-        .invert_y = DT_INST_PROP_OR(inst, invert_y, false),                               \
-        .sensitivity = DT_INST_PROP_OR(inst, sensitivity, 64),                            \
-        .move_factor = DT_INST_PROP_OR(inst, move_factor, 1),                             \
-        .scroll_factor = DT_INST_PROP_OR(inst, scroll_factor, 1),                         \
-        .poll_interval_ms = DT_INST_PROP_OR(inst, poll_interval_ms, 10),                  \
-    };                                                                                    \
-                                                                                          \
-    DEVICE_DT_INST_DEFINE(inst, trackball_pim447_init, NULL,                              \
-                          &trackball_pim447_data_##inst, &trackball_pim447_config_##inst, \
+#define TRACKBALL_PIM447_INIT(inst)                                                        \
+    static struct trackball_pim447_data trackball_pim447_data_##inst;                      \
+                                                                                           \
+    static const struct trackball_pim447_config trackball_pim447_config_##inst = {         \
+        .i2c = I2C_DT_SPEC_INST_GET(inst),                                                 \
+        .led_red = DT_INST_PROP_OR(inst, led_red, 0),                                      \
+        .led_green = DT_INST_PROP_OR(inst, led_green, 0),                                  \
+        .led_blue = DT_INST_PROP_OR(inst, led_blue, 0),                                    \
+        .led_white = DT_INST_PROP_OR(inst, led_white, 0),                                  \
+        .invert_x = DT_INST_PROP_OR(inst, invert_x, false),                                \
+        .invert_y = DT_INST_PROP_OR(inst, invert_y, false),                                \
+        .sensitivity = DT_INST_PROP_OR(inst, sensitivity, 64),                             \
+        .move_factor = DT_INST_PROP_OR(inst, move_factor, 1),                              \
+        .scroll_factor = DT_INST_PROP_OR(inst, scroll_factor, 1),                          \
+        .poll_interval_ms = DT_INST_PROP_OR(inst, poll_interval_ms, 10),                   \
+    };                                                                                     \
+                                                                                           \
+    DEVICE_DT_INST_DEFINE(inst, trackball_pim447_init, NULL,                               \
+                          &trackball_pim447_data_##inst, &trackball_pim447_config_##inst,  \
                           POST_KERNEL, CONFIG_INPUT_INIT_PRIORITY, &trackball_pim447_api);
 
 DT_INST_FOREACH_STATUS_OKAY(TRACKBALL_PIM447_INIT)
