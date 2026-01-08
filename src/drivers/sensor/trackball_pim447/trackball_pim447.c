@@ -1,13 +1,12 @@
 /*
- * Pimoroni PIM447 Trackball driver (polling, no INT pin required)
+ * PIM447 Trackball driver (polling, no INT required)
  *
- * - Polls the device over I2C
- * - Emits Zephyr input events so ZMK input listeners can consume movement
- * - Controls RGBW LED via I2C registers 0x00..0x03
- * - Clears sleep bit in REG_CTRL (0xFE) if set
- * - Reads back LED/CTRL registers for debug
- *
- * Register map and CTRL sleep mask match Pimoroni reference implementation. :contentReference[oaicite:1]{index=1}
+ * - Polls motion over I2C
+ * - Emits Zephyr input events (REL_X/REL_Y or WHEEL/HWHEEL)
+ * - LED troubleshooting:
+ *   - Clears sleep bit in REG_CTRL (0xFE)
+ *   - Writes RGBW as four single-register writes (0x00..0x03)
+ *   - Optional blink test (no logs needed)
  */
 
 #define DT_DRV_COMPAT pimoroni_trackball_pim447
@@ -25,11 +24,18 @@
 
 LOG_MODULE_REGISTER(trackball_pim447);
 
+/* ---------- LED troubleshooting switches ---------- */
+/* Set to 1 to blink LEDs for visual confirmation; set to 0 once verified */
+#define PIM447_LED_BLINK_TEST 1
+#define PIM447_LED_BLINK_PERIOD_MS 500
+/* Blink uses WHITE channel at full brightness */
+#define PIM447_LED_BLINK_W 255
+
 /* Custom sensor attributes (private range) */
 #define PIM447_ATTR_LED_RGB (SENSOR_ATTR_PRIV_START)
 #define PIM447_ATTR_MODE (SENSOR_ATTR_PRIV_START + 1)
 
-/* PIM447 register map (subset) */
+/* PIM447 registers */
 #define REG_LED_RED   0x00
 #define REG_LED_GRN   0x01
 #define REG_LED_BLU   0x02
@@ -45,14 +51,16 @@ LOG_MODULE_REGISTER(trackball_pim447);
 #define REG_CHIP_ID_H 0xFB
 #define REG_CTRL      0xFE
 
-#define MSK_SWITCH_STATE 0x80 /* pressed bit */
-#define MSK_CTRL_SLEEP   0x01 /* sleep bit */
+#define MSK_CTRL_SLEEP   0x01
 
-/* Burst read start/length (LEFT..SWITCH inclusive) */
+/* Switch pressed bit varies between implementations; support both */
+#define MSK_SWITCH_PRESSED_BIT7 0x80
+#define MSK_SWITCH_PRESSED_BIT0 0x01
+
+/* Burst read LEFT..SWITCH */
 #define MOTION_BURST_START REG_LEFT
 #define MOTION_BURST_LEN   5
 
-/* Runtime data */
 struct trackball_pim447_data {
     const struct device *dev;
 
@@ -76,10 +84,14 @@ struct trackball_pim447_data {
     uint8_t led_blue;
     uint8_t led_white;
 
+#if PIM447_LED_BLINK_TEST
+    uint32_t last_led_toggle_ms;
+    bool led_on;
+#endif
+
     struct k_work_delayable poll_work;
 };
 
-/* Build-time configuration */
 struct trackball_pim447_config {
     struct i2c_dt_spec i2c;
 
@@ -95,31 +107,20 @@ struct trackball_pim447_config {
     uint8_t move_factor;
     uint8_t scroll_factor;
 
-    /* DT: poll-interval-ms (defaults to 10 if not present) */
     uint16_t poll_interval_ms;
 };
 
 static int read_reg_u8(const struct device *dev, uint8_t reg, uint8_t *value) {
     const struct trackball_pim447_config *config = dev->config;
-
-    int err = i2c_write_read_dt(&config->i2c, &reg, sizeof(reg), value, sizeof(*value));
-    if (err) {
-        LOG_ERR("read reg 0x%02x failed: %d", reg, err);
-        return err;
-    }
-    return 0;
+    int err = i2c_write_read_dt(&config->i2c, &reg, 1, value, 1);
+    return err;
 }
 
 static int write_reg_u8(const struct device *dev, uint8_t reg, uint8_t value) {
     const struct trackball_pim447_config *config = dev->config;
     uint8_t buf[2] = {reg, value};
-
     int err = i2c_write_dt(&config->i2c, buf, sizeof(buf));
-    if (err) {
-        LOG_ERR("write reg 0x%02x failed: %d", reg, err);
-        return err;
-    }
-    return 0;
+    return err;
 }
 
 static int clear_motion_regs(const struct device *dev) {
@@ -140,13 +141,13 @@ static int clear_motion_regs(const struct device *dev) {
     return 0;
 }
 
+/* Read movement + switch */
 static int read_motion_burst(const struct device *dev, int16_t *dx, int16_t *dy, uint8_t *pressed) {
     const struct trackball_pim447_config *config = dev->config;
     uint8_t buf[MOTION_BURST_LEN] = {0};
 
     int err = i2c_burst_read_dt(&config->i2c, MOTION_BURST_START, buf, sizeof(buf));
     if (err) {
-        LOG_ERR("motion burst read failed: %d", err);
         return err;
     }
 
@@ -159,27 +160,46 @@ static int read_motion_burst(const struct device *dev, int16_t *dx, int16_t *dy,
     *dx = (int16_t)right - (int16_t)left;
     *dy = (int16_t)down  - (int16_t)up;
 
-    /* Pimoroni reference uses bit7 for pressed state */
-    *pressed = (sw & MSK_SWITCH_STATE) ? 1 : 0;
+    /* pressed: accept either bit7 or bit0 */
+    *pressed = ((sw & MSK_SWITCH_PRESSED_BIT7) || (sw & MSK_SWITCH_PRESSED_BIT0)) ? 1 : 0;
 
-    /* Prevent accumulation if the device does not auto-clear on read */
+    /* Clear motion accumulators */
     (void)clear_motion_regs(dev);
 
     return 0;
 }
 
-static int set_led_rgbw(const struct device *dev, uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
-    const struct trackball_pim447_config *config = dev->config;
-    struct trackball_pim447_data *data = dev->data;
-
-    /* Pimoroni reference: write [REG_LED_RED, r, g, b, w] */
-    uint8_t buf[5] = {REG_LED_RED, r, g, b, w};
-
-    int err = i2c_write_dt(&config->i2c, buf, sizeof(buf));
-    if (err) {
-        LOG_ERR("set LED RGBW(%u,%u,%u,%u) failed: %d", r, g, b, w, err);
-        return err;
+/* Force device awake (clear sleep bit) */
+static void pim447_force_awake(const struct device *dev) {
+    uint8_t ctrl = 0;
+    if (read_reg_u8(dev, REG_CTRL, &ctrl) == 0) {
+        if (ctrl & MSK_CTRL_SLEEP) {
+            ctrl &= ~MSK_CTRL_SLEEP;
+            (void)write_reg_u8(dev, REG_CTRL, ctrl);
+            k_sleep(K_MSEC(2));
+        }
     }
+}
+
+/*
+ * LED set via FOUR single-register writes (matches Pimoroni style).
+ * This avoids relying on multi-byte auto-increment behavior.
+ */
+static int set_led_rgbw(const struct device *dev, uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
+    struct trackball_pim447_data *data = dev->data;
+    int err;
+
+    err = write_reg_u8(dev, REG_LED_RED, r);
+    if (err) return err;
+
+    err = write_reg_u8(dev, REG_LED_GRN, g);
+    if (err) return err;
+
+    err = write_reg_u8(dev, REG_LED_BLU, b);
+    if (err) return err;
+
+    err = write_reg_u8(dev, REG_LED_WHT, w);
+    if (err) return err;
 
     data->led_red = r;
     data->led_green = g;
@@ -202,17 +222,15 @@ static void apply_scaling(struct trackball_pim447_data *data) {
     data->dy = (data->dy * data->sensitivity) / 64;
 
     if (data->mode == 0) {
-        /* Move mode */
         data->dx = data->dx * data->move_factor;
         data->dy = data->dy * data->move_factor;
     } else {
-        /* Scroll mode */
         data->dx = data->dx * data->scroll_factor;
         data->dy = data->dy * data->scroll_factor;
     }
 }
 
-/* Sensor API: fetch latest sample (we always read all channels in one burst) */
+/* Sensor API (optional; used only for custom attrs) */
 static int trackball_pim447_sample_fetch(const struct device *dev, enum sensor_channel chan) {
     struct trackball_pim447_data *data = dev->data;
     int err;
@@ -228,7 +246,6 @@ static int trackball_pim447_sample_fetch(const struct device *dev, enum sensor_c
     return 0;
 }
 
-/* Sensor API: get cached channel values (optional) */
 static int trackball_pim447_channel_get(const struct device *dev, enum sensor_channel chan,
                                         struct sensor_value *val) {
     struct trackball_pim447_data *data = dev->data;
@@ -254,7 +271,7 @@ static int trackball_pim447_channel_get(const struct device *dev, enum sensor_ch
     }
 }
 
-/* Sensor API: set custom attributes (mode + LED RGB) */
+/* Custom attributes: mode + set RGB (keeps current white) */
 static int trackball_pim447_attr_set(const struct device *dev, enum sensor_channel chan,
                                      enum sensor_attribute attr, const struct sensor_value *val) {
     struct trackball_pim447_data *data = dev->data;
@@ -266,7 +283,6 @@ static int trackball_pim447_attr_set(const struct device *dev, enum sensor_chann
         if (!val) {
             return -EINVAL;
         }
-        /* Expect val[0], val[1], val[2] => RGB. Keep current white unchanged. */
         uint8_t r = CLAMP(val[0].val1, 0, 255);
         uint8_t g = CLAMP(val[1].val1, 0, 255);
         uint8_t b = CLAMP(val[2].val1, 0, 255);
@@ -278,7 +294,6 @@ static int trackball_pim447_attr_set(const struct device *dev, enum sensor_chann
             return -EINVAL;
         }
         data->mode = (val->val1 > 0) ? 1 : 0;
-        LOG_INF("Trackball mode set to %s", data->mode == 0 ? "MOVE" : "SCROLL");
         return 0;
     }
 
@@ -325,41 +340,26 @@ static void poll_work_handler(struct k_work *work) {
         emit_input_events(dev);
     }
 
+#if PIM447_LED_BLINK_TEST
+    /* Visual-only LED test: blink WHITE every 500ms, and force awake periodically */
+    uint32_t now = k_uptime_get_32();
+    if ((now - data->last_led_toggle_ms) >= PIM447_LED_BLINK_PERIOD_MS) {
+        data->last_led_toggle_ms = now;
+        data->led_on = !data->led_on;
+
+        /* Keep device awake (in case it boots sleeping or re-sleeps) */
+        pim447_force_awake(dev);
+
+        /* Blink white channel */
+        (void)set_led_rgbw(dev, 0, 0, 0, data->led_on ? PIM447_LED_BLINK_W : 0);
+    }
+#endif
+
     const uint16_t interval = MAX(config->poll_interval_ms, 1);
     (void)k_work_schedule(&data->poll_work, K_MSEC(interval));
 }
 
-static int wake_if_sleeping(const struct device *dev) {
-    uint8_t ctrl = 0;
-    int err = read_reg_u8(dev, REG_CTRL, &ctrl);
-    if (err) {
-        return err;
-    }
-
-    if (ctrl & MSK_CTRL_SLEEP) {
-        LOG_INF("PIM447 CTRL=0x%02x (sleep set), waking", ctrl);
-        ctrl &= ~MSK_CTRL_SLEEP;
-        err = write_reg_u8(dev, REG_CTRL, ctrl);
-        if (err) {
-            return err;
-        }
-        k_sleep(K_MSEC(2));
-    }
-
-    return 0;
-}
-
-static void log_led_regs(const struct device *dev) {
-    uint8_t r = 0, g = 0, b = 0, w = 0, ctrl = 0;
-    (void)read_reg_u8(dev, REG_LED_RED, &r);
-    (void)read_reg_u8(dev, REG_LED_GRN, &g);
-    (void)read_reg_u8(dev, REG_LED_BLU, &b);
-    (void)read_reg_u8(dev, REG_LED_WHT, &w);
-    (void)read_reg_u8(dev, REG_CTRL, &ctrl);
-    LOG_INF("PIM447 regs: LED R=%u G=%u B=%u W=%u | CTRL=0x%02x", r, g, b, w, ctrl);
-}
-
-static void log_chip_id(const struct device *dev) {
+static void log_chip_id_best_effort(const struct device *dev) {
     uint8_t lo = 0, hi = 0;
     if (read_reg_u8(dev, REG_CHIP_ID_L, &lo) == 0 && read_reg_u8(dev, REG_CHIP_ID_H, &hi) == 0) {
         uint16_t chip_id = ((uint16_t)hi << 8) | lo;
@@ -374,7 +374,6 @@ static int trackball_pim447_init(const struct device *dev) {
     data->dev = dev;
 
     if (!device_is_ready(config->i2c.bus)) {
-        LOG_ERR("I2C bus not ready");
         return -ENODEV;
     }
 
@@ -383,41 +382,35 @@ static int trackball_pim447_init(const struct device *dev) {
     data->sensitivity = config->sensitivity;
     data->move_factor = config->move_factor;
     data->scroll_factor = config->scroll_factor;
+
     data->mode = 0; /* default MOVE */
     data->prev_button_state = 0;
 
-    /* Log chip id (useful sanity check) */
-    log_chip_id(dev);
-
-    /* Ensure awake before LED writes */
-    int err = wake_if_sleeping(dev);
-    if (err) {
-        LOG_ERR("Failed to read/clear CTRL sleep bit: %d", err);
-        return err;
-    }
-
-    /* Set initial LED RGBW from devicetree config */
+    data->led_red = config->led_red;
+    data->led_green = config->led_green;
+    data->led_blue = config->led_blue;
     data->led_white = config->led_white;
-    err = set_led_rgbw(dev, config->led_red, config->led_green, config->led_blue, config->led_white);
-    if (err) {
-        LOG_ERR("Failed to set initial LED color: %d", err);
-        return err;
-    }
 
-    /* Read back LED regs so you can confirm writes are landing */
-    log_led_regs(dev);
+#if PIM447_LED_BLINK_TEST
+    data->last_led_toggle_ms = k_uptime_get_32();
+    data->led_on = false;
+#endif
+
+    /* Optional sanity check if logging is enabled */
+    log_chip_id_best_effort(dev);
+
+    /* Force awake, then set initial LED from devicetree */
+    pim447_force_awake(dev);
+    (void)set_led_rgbw(dev, data->led_red, data->led_green, data->led_blue, data->led_white);
 
     k_work_init_delayable(&data->poll_work, poll_work_handler);
 
-    /* Start polling */
     const uint16_t interval = MAX(config->poll_interval_ms, 1);
     (void)k_work_schedule(&data->poll_work, K_MSEC(interval));
 
-    LOG_INF("PIM447 init ok (addr 0x%02x, poll %ums)", config->i2c.addr, config->poll_interval_ms);
     return 0;
 }
 
-/* Driver instantiation */
 #define TRACKBALL_PIM447_INIT(inst)                                                        \
     static struct trackball_pim447_data trackball_pim447_data_##inst;                      \
                                                                                            \
