@@ -54,13 +54,6 @@ properties:
     min: 0
     max: 255
 
-  led-white:
-    type: int
-    default: 0
-    description: White component of LED color (0-255)
-    min: 0
-    max: 255
-
   invert-x:
     type: boolean
     description: Invert X-axis direction
