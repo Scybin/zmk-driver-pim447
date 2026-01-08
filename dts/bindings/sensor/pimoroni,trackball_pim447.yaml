@@ -61,3 +61,10 @@ properties:
   invert-y:
     type: boolean
     description: Invert Y-axis direction
+
+  poll-interval-ms:
+    type: int
+    default: 10
+    description: Poll interval in milliseconds when no INT pin is used
+    min: 1
+    max: 100
