@@ -6,12 +6,7 @@ compatible: "pimoroni,trackball_pim447"
 
 include: i2c-device.yaml
 
-properties:
-  reg:
-    type: int
-    required: true
-    description: I2C device address (0x0A)
-  
+properties:  
   sensitivity:
     type: int
     default: 64
