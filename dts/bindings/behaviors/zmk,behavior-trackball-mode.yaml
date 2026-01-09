@@ -5,7 +5,7 @@ description: Trackball mode behavior
 
 compatible: "zmk,behavior-trackball-mode"
 
-include: one_param.yaml
+#include: zmk,behavior-base.yaml
 
 properties:
   label:
